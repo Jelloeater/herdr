@@ -9,6 +9,7 @@ use crate::api::schema::{
 };
 
 mod agent;
+mod completion;
 mod integration;
 mod pane;
 mod server;
@@ -37,6 +38,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "status" => status::run_status_command(&args[2..])?,
         "config" => run_config_command(&args[2..])?,
         "channel" => run_channel_command(&args[2..])?,
+        "completion" => completion::run_completion_command(&args[2..])?,
         "workspace" => workspace::run_workspace_command(&args[2..])?,
         "worktree" => worktree::run_worktree_command(&args[2..])?,
         "tab" => tab::run_tab_command(&args[2..])?,
