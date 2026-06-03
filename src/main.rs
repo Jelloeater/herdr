@@ -416,6 +416,7 @@ fn main() -> io::Result<()> {
         println!("       herdr server reload-config");
         println!("       herdr config <subcommand> ...");
         println!("       herdr channel <subcommand> ...");
+        println!("       herdr completion <shell>");
         println!("       herdr workspace <subcommand> ...");
         println!("       herdr worktree <subcommand> ...");
         println!("       herdr tab <subcommand> ...");
