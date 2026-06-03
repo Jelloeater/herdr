@@ -33,6 +33,45 @@ herdr status server
 herdr status client
 ```
 
+## Shell completion
+
+Generate shell completion scripts:
+
+```bash
+herdr completion zsh    # generate zsh completion script
+```
+
+### Installation
+
+#### Zsh
+
+Generate the completion script and save it to a file:
+
+```bash
+herdr completion zsh > ~/.herdr_completion.zsh
+```
+
+Source the completion script in your `~/.zshrc`:
+
+```bash
+# Add this line to ~/.zshrc
+source ~/.herdr_completion.zsh
+```
+
+Reload your shell configuration:
+
+```bash
+source ~/.zshrc
+```
+
+After installation, you can use tab completion with herdr commands:
+
+```bash
+herdr <tab>           # list all available commands
+herdr workspace <tab> # list workspace subcommands
+herdr agent start --<tab>  # list available flags
+```
+
 ## Server
 
 ```bash
