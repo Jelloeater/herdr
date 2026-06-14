@@ -4,19 +4,34 @@ use serde::Serialize;
 
 use crate::api::client::{ApiClient, ApiClientError};
 use crate::api::schema::{
-    AgentStatus, Method, OutputMatch, PaneAgentState, PaneWaitForOutputParams, ReadFormat,
-    ReadSource, Request, SplitDirection, Subscription,
+    AgentStatus, ClientWindowTitleSetParams, EmptyParams, Method, OutputMatch, PaneAgentState,
+    PaneWaitForOutputParams, ReadFormat, ReadSource, Request, SplitDirection, Subscription,
 };
 
 mod agent;
 mod completion;
 mod integration;
+mod notification;
 mod pane;
+mod plugin;
 mod server;
 mod status;
 mod tab;
 mod workspace;
 mod worktree;
+
+pub(crate) fn parse_env_assignment(raw: &str) -> Result<(String, String), String> {
+    let Some((key, value)) = raw.split_once('=') else {
+        return Err("env must use KEY=VALUE".into());
+    };
+    if key.is_empty() {
+        return Err("env key must not be empty".into());
+    }
+    if key.contains('\0') || value.contains('\0') {
+        return Err("env must not contain NUL bytes".into());
+    }
+    Ok((key.to_string(), value.to_string()))
+}
 
 pub enum CommandOutcome {
     Handled(i32),
@@ -42,9 +57,11 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "workspace" => workspace::run_workspace_command(&args[2..])?,
         "worktree" => worktree::run_worktree_command(&args[2..])?,
         "tab" => tab::run_tab_command(&args[2..])?,
+        "notification" => notification::run_notification_command(&args[2..])?,
         "agent" => agent::run_agent_command(&args[2..])?,
         "terminal" => run_terminal_command(&args[2..])?,
         "pane" => pane::run_pane_command(&args[2..])?,
+        "plugin" => plugin::run_plugin_command(&args[2..])?,
         "wait" => run_wait_command(&args[2..])?,
         "integration" => integration::run_integration_command(&args[2..])?,
         "session" => run_session_command(&args[2..])?,
@@ -78,6 +95,14 @@ fn channel_set(args: &[String]) -> std::io::Result<i32> {
         eprintln!("usage: herdr channel set <stable|preview>");
         return Ok(2);
     };
+
+    if let Some(reason) = channel_set_rejection(
+        channel,
+        crate::update::preview_channel_rejection_for_current_install(),
+    ) {
+        eprintln!("{reason}.");
+        return Ok(1);
+    }
 
     let path = crate::config::config_path();
     let content = if path.exists() {
@@ -114,11 +139,23 @@ fn channel_set(args: &[String]) -> std::io::Result<i32> {
         "Herdr update channel set to {channel} in {}.",
         path.display()
     );
-    if channel == "preview" {
-        println!("Run `herdr update` to install the latest preview build when ready.");
-    } else {
-        println!("Run `herdr update` to install the latest stable release when ready.");
+
+    match channel_set_install_action(
+        crate::update::package_manager_channel_update_guidance_for_current_install(),
+    ) {
+        ChannelSetInstallAction::PrintGuidance(guidance) => {
+            println!("{guidance}");
+            return Ok(0);
+        }
+        ChannelSetInstallAction::RunSelfUpdate => {}
     }
+
+    if let Err(err) = crate::update::self_update(crate::update::SelfUpdateOptions::default()) {
+        eprintln!("update failed: {err}");
+        eprintln!("Run `herdr update` to retry.");
+        return Ok(1);
+    }
+
     Ok(0)
 }
 
@@ -128,6 +165,38 @@ fn parse_channel_set_arg(args: &[String]) -> Option<&str> {
         Some(channel)
     } else {
         None
+    }
+}
+
+fn channel_set_rejection(
+    channel: &str,
+    install_rejection: Option<&'static str>,
+) -> Option<&'static str> {
+    if cfg!(windows) && channel == "stable" {
+        return Some(
+            "stable channel is not available on Windows yet; Windows builds are preview-only",
+        );
+    }
+
+    if channel == "preview" {
+        return install_rejection;
+    }
+
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelSetInstallAction {
+    RunSelfUpdate,
+    PrintGuidance(&'static str),
+}
+
+fn channel_set_install_action(
+    package_manager_guidance: Option<&'static str>,
+) -> ChannelSetInstallAction {
+    match package_manager_guidance {
+        Some(guidance) => ChannelSetInstallAction::PrintGuidance(guidance),
+        None => ChannelSetInstallAction::RunSelfUpdate,
     }
 }
 
@@ -253,6 +322,7 @@ fn run_terminal_command(args: &[String]) -> std::io::Result<i32> {
 
     match subcommand {
         "attach" => terminal_attach(&args[1..]),
+        "title" => terminal_title(&args[1..]),
         "help" | "--help" | "-h" => {
             print_terminal_help();
             Ok(0)
@@ -404,6 +474,43 @@ fn terminal_attach(args: &[String]) -> std::io::Result<i32> {
     };
     crate::client::run_terminal_attach(terminal_id, takeover)?;
     Ok(0)
+}
+
+fn terminal_title(args: &[String]) -> std::io::Result<i32> {
+    match args.first().map(|arg| arg.as_str()) {
+        Some("set") => {
+            if args.len() != 2 {
+                eprintln!("usage: herdr terminal title set <title>");
+                return Ok(2);
+            }
+            print_response(&send_request(&Request {
+                id: "cli:terminal:title:set".into(),
+                method: Method::ClientWindowTitleSet(ClientWindowTitleSetParams {
+                    title: args[1].clone(),
+                }),
+            })?)
+        }
+        Some("clear") => {
+            if args.len() != 1 {
+                eprintln!("usage: herdr terminal title clear");
+                return Ok(2);
+            }
+            print_response(&send_request(&Request {
+                id: "cli:terminal:title:clear".into(),
+                method: Method::ClientWindowTitleClear(EmptyParams::default()),
+            })?)
+        }
+        Some("help" | "--help" | "-h") => {
+            eprintln!("usage: herdr terminal title set <title>");
+            eprintln!("       herdr terminal title clear");
+            Ok(0)
+        }
+        _ => {
+            eprintln!("usage: herdr terminal title set <title>");
+            eprintln!("       herdr terminal title clear");
+            Ok(2)
+        }
+    }
 }
 
 pub(super) fn parse_attach_target(args: &[String], usage: &str) -> Result<(String, bool), i32> {
@@ -685,6 +792,7 @@ pub(super) fn parse_read_source(value: &str) -> std::io::Result<ReadSource> {
         "visible" => Ok(ReadSource::Visible),
         "recent" => Ok(ReadSource::Recent),
         "recent-unwrapped" | "recent_unwrapped" => Ok(ReadSource::RecentUnwrapped),
+        "detection" => Ok(ReadSource::Detection),
         _ => Err(std::io::Error::other(format!(
             "invalid read source: {value}"
         ))),
@@ -808,6 +916,8 @@ fn print_config_help() {
 fn print_terminal_help() {
     eprintln!("herdr terminal commands:");
     eprintln!("  herdr terminal attach <terminal_id> [--takeover]");
+    eprintln!("  herdr terminal title set <title>");
+    eprintln!("  herdr terminal title clear");
     eprintln!("  detach from direct attach with ctrl+b q; send literal ctrl+b with ctrl+b ctrl+b");
 }
 
@@ -848,6 +958,67 @@ mod tests {
         assert_eq!(
             super::parse_channel_set_arg(&["preview".to_string(), "stable".to_string()]),
             None
+        );
+    }
+
+    #[test]
+    fn channel_set_rejects_package_managed_preview_before_config_write() {
+        assert_eq!(
+            super::channel_set_rejection("preview", Some("no preview")),
+            Some("no preview")
+        );
+        assert_eq!(
+            super::channel_set_rejection("stable", Some("no preview")),
+            if cfg!(windows) {
+                Some(
+                    "stable channel is not available on Windows yet; Windows builds are preview-only",
+                )
+            } else {
+                None
+            }
+        );
+        assert_eq!(super::channel_set_rejection("preview", None), None);
+    }
+
+    #[test]
+    fn channel_set_rejects_stable_only_on_windows() {
+        assert_eq!(
+            super::channel_set_rejection("stable", None),
+            if cfg!(windows) {
+                Some(
+                    "stable channel is not available on Windows yet; Windows builds are preview-only",
+                )
+            } else {
+                None
+            }
+        );
+    }
+
+    #[test]
+    fn channel_set_skips_self_update_for_package_manager_guidance() {
+        assert_eq!(
+            super::channel_set_install_action(Some("use package manager")),
+            super::ChannelSetInstallAction::PrintGuidance("use package manager")
+        );
+        assert_eq!(
+            super::channel_set_install_action(None),
+            super::ChannelSetInstallAction::RunSelfUpdate
+        );
+    }
+
+    #[test]
+    fn parse_env_assignment_accepts_empty_values() {
+        assert_eq!(
+            super::parse_env_assignment("HERDR_ROLE=").unwrap(),
+            ("HERDR_ROLE".to_string(), String::new())
+        );
+    }
+
+    #[test]
+    fn parse_env_assignment_requires_key_value_separator() {
+        assert_eq!(
+            super::parse_env_assignment("HERDR_ROLE").unwrap_err(),
+            "env must use KEY=VALUE"
         );
     }
 }

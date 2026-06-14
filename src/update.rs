@@ -8,13 +8,19 @@
 
 use std::collections::BTreeMap;
 use std::env;
+#[cfg(not(windows))]
 use std::fs;
-use std::io::{self, BufRead, BufReader, IsTerminal, Write};
-use std::os::unix::net::UnixStream;
+#[cfg(not(windows))]
+use std::io;
+#[cfg(not(windows))]
+use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(not(windows))]
 use std::time::{Duration, Instant};
 
+#[cfg(not(windows))]
+use interprocess::local_socket::traits::Stream as _;
 use serde::{Deserialize, Deserializer};
 
 const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
@@ -22,13 +28,19 @@ const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
 const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/herdr.json";
 const HERDR_UPDATE_COMMAND: &str = "herdr update";
 const HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade herdr";
+const MISE_UPDATE_COMMAND: &str = "mise upgrade herdr";
 const NIX_UPDATE_COMMAND: &str = "update through Nix";
+const MISE_INSTALLS_DIR_ENV: &str = "MISE_INSTALLS_DIR";
 const FAKE_UPDATE_VERSION_ENV: &str = "HERDR_FAKE_UPDATE_VERSION";
 const FAKE_UPDATE_NOTES_VERSION_ENV: &str = "HERDR_FAKE_UPDATE_NOTES_VERSION";
 const DEFAULT_FAKE_UPDATE_NOTES_VERSION: &str = "0.3.0";
+#[cfg(not(windows))]
 const SERVER_STOP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(not(windows))]
 const SERVER_HANDOFF_REQUEST_TIMEOUT: Duration = Duration::from_secs(240);
+#[cfg(not(windows))]
 const SERVER_HANDOFF_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(not(windows))]
 const SERVER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 fn fake_release_notes_body(version: &str) -> String {
     let notes_version = env::var(FAKE_UPDATE_NOTES_VERSION_ENV)
@@ -153,6 +165,7 @@ impl<'de> Deserialize<'de> for AssetRef {
 struct UpdateManifest {
     version: String,
     /// Thin-client protocol spoken by this release, when advertised by the manifest.
+    #[cfg(not(windows))]
     protocol: Option<u32>,
     notes: String,
     assets: BTreeMap<String, AssetRef>,
@@ -214,7 +227,7 @@ struct HomebrewFormulaVersions {
 }
 
 impl UpdateManifest {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn download_url_for(&self, os: &str, arch: &str) -> Option<String> {
         self.assets
             .get(&format!("{os}-{arch}"))
@@ -256,6 +269,7 @@ struct ReleaseInfo {
     channel: UpdateChannel,
     build_id: Option<String>,
     commit: Option<String>,
+    #[cfg(not(windows))]
     target_protocol: Option<u32>,
     download_url: String,
     sha256: Option<String>,
@@ -355,6 +369,7 @@ fn release_info_from_manifest(manifest: &UpdateManifest) -> Result<Option<Releas
         channel: UpdateChannel::Stable,
         build_id: None,
         commit: None,
+        #[cfg(not(windows))]
         target_protocol: manifest.protocol,
         download_url,
         sha256: asset.sha256.clone(),
@@ -439,6 +454,7 @@ fn release_info_from_preview_manifest(
         channel: UpdateChannel::Preview,
         build_id: Some(build_id.to_string()),
         commit: Some(manifest.commit.clone()),
+        #[cfg(not(windows))]
         target_protocol: Some(manifest.protocol),
         download_url,
         sha256: asset.sha256.clone(),
@@ -517,11 +533,13 @@ fn check_homebrew_latest() -> Result<Option<Version>, String> {
 // Download + install
 // ---------------------------------------------------------------------------
 
+#[cfg(not(windows))]
 struct DownloadedUpdate {
     current_exe: PathBuf,
     tmp_path: Option<PathBuf>,
 }
 
+#[cfg(not(windows))]
 impl Drop for DownloadedUpdate {
     fn drop(&mut self) {
         if let Some(tmp_path) = self.tmp_path.take() {
@@ -531,6 +549,7 @@ impl Drop for DownloadedUpdate {
 }
 
 /// Download a release to a prepared executable temp file without touching the running server.
+#[cfg(not(windows))]
 fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
     let current_exe = env::current_exe().map_err(|e| format!("can't find current binary: {e}"))?;
 
@@ -590,6 +609,7 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
     })
 }
 
+#[cfg(not(windows))]
 fn install_downloaded_update(mut update: DownloadedUpdate) -> Result<(), String> {
     let tmp_path = update
         .tmp_path
@@ -607,6 +627,42 @@ fn install_downloaded_update(mut update: DownloadedUpdate) -> Result<(), String>
     Ok(())
 }
 
+#[cfg(windows)]
+fn install_windows_update_with_installer(channel: UpdateChannel) -> Result<(), String> {
+    let status = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            "irm https://herdr.dev/install.ps1 | iex",
+        ])
+        .env("HERDR_CHANNEL", channel.as_str())
+        .status()
+        .map_err(|err| format!("failed to run Windows installer: {err}"))?;
+
+    if !status.success() {
+        return Err(format!("Windows installer failed with status {status}"));
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_installed_herdr_exe_path() -> Result<PathBuf, String> {
+    if let Some(install_dir) = env::var_os("HERDR_INSTALL_DIR").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(install_dir).join("herdr.exe"));
+    }
+
+    let local_app_data = env::var_os("LOCALAPPDATA")
+        .ok_or("LOCALAPPDATA is not set; cannot locate Herdr install")?;
+    Ok(PathBuf::from(local_app_data)
+        .join("Programs")
+        .join("Herdr")
+        .join("bin")
+        .join("herdr.exe"))
+}
+
 // ---------------------------------------------------------------------------
 // Upgrade flow helpers
 // ---------------------------------------------------------------------------
@@ -619,22 +675,26 @@ fn running_inside_herdr() -> bool {
     running_inside_herdr_env(env::var(crate::HERDR_ENV_VAR).ok().as_deref())
 }
 
+#[cfg(not(windows))]
 fn client_protocol_server_is_running_at(socket_path: &Path) -> bool {
     if !socket_path.exists() {
         return false;
     }
 
-    UnixStream::connect(socket_path).is_ok()
+    crate::ipc::connect_local_stream(socket_path).is_ok()
 }
 
+#[cfg(not(windows))]
 fn client_protocol_server_is_running() -> bool {
     client_protocol_server_is_running_at(&crate::server::socket_paths::client_socket_path())
 }
 
+#[cfg(not(windows))]
 fn version_label(version: Option<&str>) -> &str {
     version.unwrap_or("unknown")
 }
 
+#[cfg(not(windows))]
 fn update_requires_server_restart(
     server: &crate::api::RuntimeStatus,
     release: &ReleaseInfo,
@@ -645,6 +705,7 @@ fn update_requires_server_restart(
     }
 }
 
+#[cfg(not(windows))]
 fn server_supports_live_handoff(server: &crate::api::RuntimeStatus) -> bool {
     server
         .capabilities
@@ -652,6 +713,7 @@ fn server_supports_live_handoff(server: &crate::api::RuntimeStatus) -> bool {
         .is_some_and(|capabilities| capabilities.live_handoff)
 }
 
+#[cfg(not(windows))]
 fn parse_stop_old_servers_after_update_response(input: &str, default_yes: bool) -> Option<bool> {
     let trimmed = input.trim().to_ascii_lowercase();
     match trimmed.as_str() {
@@ -663,12 +725,14 @@ fn parse_stop_old_servers_after_update_response(input: &str, default_yes: bool) 
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(not(windows))]
 struct RunningServerUpdatePlan {
     target: RunningUpdateTarget,
     server: crate::api::RuntimeStatus,
     requires_server_restart: bool,
 }
 
+#[cfg(not(windows))]
 impl RunningServerUpdatePlan {
     fn label(&self) -> &str {
         &self.target.label
@@ -696,12 +760,14 @@ impl RunningServerUpdatePlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(not(windows))]
 struct RunningServerUpdateDecision {
     plan: RunningServerUpdatePlan,
     action: RunningServerUpdateAction,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(not(windows))]
 enum RunningServerUpdateAction {
     None,
     LiveHandoff,
@@ -709,6 +775,7 @@ enum RunningServerUpdateAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(not(windows))]
 enum RunningServerUpdateOutcome {
     RestartDeferred,
     Stopped,
@@ -720,6 +787,7 @@ enum RunningServerUpdateOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(not(windows))]
 struct RunningSessionUpdateOutcome {
     session_label: String,
     target_noun: &'static str,
@@ -730,6 +798,7 @@ struct RunningSessionUpdateOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(not(windows))]
 enum FailedHandoffServerState {
     UpdatedServerRunning,
     OldServerRunning(crate::api::RuntimeStatus),
@@ -737,6 +806,7 @@ enum FailedHandoffServerState {
     Unknown(String),
 }
 
+#[cfg(not(windows))]
 fn plan_running_server_updates(
     release: &ReleaseInfo,
 ) -> Result<Vec<RunningServerUpdatePlan>, String> {
@@ -794,6 +864,7 @@ fn plan_running_server_updates(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(not(windows))]
 struct RunningUpdateTarget {
     name: Option<String>,
     label: String,
@@ -804,6 +875,7 @@ struct RunningUpdateTarget {
     must_be_running: bool,
 }
 
+#[cfg(not(windows))]
 fn running_update_targets() -> Result<Vec<RunningUpdateTarget>, String> {
     if crate::session::explicit_session_requested() {
         return Ok(vec![RunningUpdateTarget {
@@ -870,6 +942,7 @@ fn running_update_targets() -> Result<Vec<RunningUpdateTarget>, String> {
         .collect())
 }
 
+#[cfg(not(windows))]
 fn target_client_protocol_server_is_running() -> Result<bool, String> {
     if crate::session::explicit_session_requested()
         || std::env::var_os(crate::api::SOCKET_PATH_ENV_VAR).is_some()
@@ -908,6 +981,7 @@ pub(crate) fn parse_self_update_args(args: &[String]) -> Result<SelfUpdateOption
     Ok(options)
 }
 
+#[cfg(not(windows))]
 fn prompt_to_stop_old_servers_before_update(
     plans: &[RunningServerUpdatePlan],
     release: &ReleaseInfo,
@@ -956,6 +1030,7 @@ fn prompt_to_stop_old_servers_before_update(
     }
 }
 
+#[cfg(not(windows))]
 fn confirm_running_server_update_action(
     plans: Vec<RunningServerUpdatePlan>,
     release: &ReleaseInfo,
@@ -1010,6 +1085,7 @@ fn confirm_running_server_update_action(
     Ok(decisions)
 }
 
+#[cfg(not(windows))]
 fn target_group_nouns(plans: &[&RunningServerUpdatePlan]) -> (&'static str, &'static str) {
     let all_sessions = plans.iter().all(|plan| plan.target_noun() == "session");
     let all_servers = plans.iter().all(|plan| plan.target_noun() == "server");
@@ -1022,6 +1098,7 @@ fn target_group_nouns(plans: &[&RunningServerUpdatePlan]) -> (&'static str, &'st
     }
 }
 
+#[cfg(not(windows))]
 fn prompt_to_complete_plain_update(
     decisions: &[RunningServerUpdateDecision],
     release: &ReleaseInfo,
@@ -1078,6 +1155,7 @@ fn prompt_to_complete_plain_update(
     }
 }
 
+#[cfg(not(windows))]
 fn mark_plain_update_stop_decisions(
     decisions: Vec<RunningServerUpdateDecision>,
 ) -> Vec<RunningServerUpdateDecision> {
@@ -1090,6 +1168,7 @@ fn mark_plain_update_stop_decisions(
         .collect()
 }
 
+#[cfg(not(windows))]
 fn print_running_session_update_summary(
     plans: &[RunningServerUpdatePlan],
     release: &ReleaseInfo,
@@ -1121,6 +1200,7 @@ fn print_running_session_update_summary(
     eprintln!();
 }
 
+#[cfg(not(windows))]
 fn live_handoff_running_server_for_update(
     plan: &RunningServerUpdatePlan,
     release: &ReleaseInfo,
@@ -1141,6 +1221,7 @@ fn live_handoff_running_server_for_update(
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn runtime_matches_release(status: &crate::api::RuntimeStatus, release: &ReleaseInfo) -> bool {
     let protocol_matches = release
         .target_protocol
@@ -1149,6 +1230,7 @@ fn runtime_matches_release(status: &crate::api::RuntimeStatus, release: &Release
     protocol_matches && version_matches
 }
 
+#[cfg(not(windows))]
 fn classify_failed_live_handoff_state_at(
     socket_path: &Path,
     release: &ReleaseInfo,
@@ -1163,6 +1245,7 @@ fn classify_failed_live_handoff_state_at(
     }
 }
 
+#[cfg(not(windows))]
 fn prompt_to_stop_old_server_after_failed_handoff(
     plan: &RunningServerUpdatePlan,
     release: &ReleaseInfo,
@@ -1211,6 +1294,7 @@ fn prompt_to_stop_old_server_after_failed_handoff(
     }
 }
 
+#[cfg(not(windows))]
 fn recover_failed_live_handoff_for_update(
     plan: &RunningServerUpdatePlan,
     release: &ReleaseInfo,
@@ -1267,6 +1351,7 @@ fn recover_failed_live_handoff_for_update(
     }
 }
 
+#[cfg(not(windows))]
 fn reconnect_or_stop_guidance(plan: &RunningServerUpdatePlan) -> String {
     if let Some(command) = plan.attach_command() {
         format!(
@@ -1281,6 +1366,7 @@ fn reconnect_or_stop_guidance(plan: &RunningServerUpdatePlan) -> String {
     }
 }
 
+#[cfg(not(windows))]
 fn stop_server_via_api_at(socket_path: &Path, timeout: Duration) -> Result<(), String> {
     use crate::api::schema::{EmptyParams, Method};
 
@@ -1293,6 +1379,7 @@ fn stop_server_via_api_at(socket_path: &Path, timeout: Duration) -> Result<(), S
     )
 }
 
+#[cfg(not(windows))]
 fn send_server_update_method_at(
     socket_path: &Path,
     timeout: Duration,
@@ -1307,13 +1394,13 @@ fn send_server_update_method_at(
         method,
     };
 
-    let mut stream = UnixStream::connect(socket_path)
+    let mut stream = crate::ipc::connect_local_stream(socket_path)
         .map_err(|e| format!("failed to connect to running server: {e}"))?;
     stream
-        .set_write_timeout(Some(timeout))
+        .set_send_timeout(Some(timeout))
         .map_err(|e| format!("failed to set {error_prefix} write timeout: {e}"))?;
     stream
-        .set_read_timeout(Some(timeout))
+        .set_recv_timeout(Some(timeout))
         .map_err(|e| format!("failed to set {error_prefix} read timeout: {e}"))?;
     stream
         .write_all(
@@ -1346,7 +1433,7 @@ fn send_server_update_method_at(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn live_handoff_server_via_api_at(socket_path: &Path, timeout: Duration) -> Result<(), String> {
     use crate::api::schema::{Method, ServerLiveHandoffParams};
 
@@ -1361,6 +1448,7 @@ fn live_handoff_server_via_api_at(socket_path: &Path, timeout: Duration) -> Resu
     )
 }
 
+#[cfg(not(windows))]
 fn live_handoff_server_via_api_for_release_at(
     socket_path: &Path,
     timeout: Duration,
@@ -1384,6 +1472,7 @@ fn live_handoff_server_via_api_for_release_at(
     )
 }
 
+#[cfg(not(windows))]
 fn live_handoff_server_via_api_for_update_at(
     socket_path: &Path,
     updated_exe: &Path,
@@ -1397,12 +1486,13 @@ fn live_handoff_server_via_api_for_update_at(
     )
 }
 
+#[cfg(not(windows))]
 fn server_shutdown_confirmed_at(socket_path: &Path) -> Result<bool, String> {
     if !socket_path.exists() {
         return Ok(true);
     }
 
-    match UnixStream::connect(socket_path) {
+    match crate::ipc::connect_local_stream(socket_path) {
         Ok(_) => Ok(false),
         Err(err)
             if matches!(
@@ -1421,6 +1511,7 @@ fn server_shutdown_confirmed_at(socket_path: &Path) -> Result<bool, String> {
     }
 }
 
+#[cfg(not(windows))]
 fn wait_for_server_shutdown_at(socket_path: &Path, timeout: Duration) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -1438,6 +1529,7 @@ fn wait_for_server_shutdown_at(socket_path: &Path, timeout: Duration) -> Result<
     }
 }
 
+#[cfg(not(windows))]
 fn stop_running_server_for_update(plan: &RunningServerUpdatePlan) -> Result<(), String> {
     eprintln!("stopping herdr {} {}...", plan.target_noun(), plan.label());
     stop_server_via_api_at(plan.socket_path(), SERVER_STOP_RESPONSE_TIMEOUT)?;
@@ -1445,6 +1537,7 @@ fn stop_running_server_for_update(plan: &RunningServerUpdatePlan) -> Result<(), 
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn wait_for_server_handoff_at(
     socket_path: &Path,
     timeout: Duration,
@@ -1458,6 +1551,7 @@ fn wait_for_server_handoff_at(
     )
 }
 
+#[cfg(not(windows))]
 fn wait_for_running_server_protocol_at(
     socket_path: &Path,
     timeout: Duration,
@@ -1489,6 +1583,7 @@ fn wait_for_running_server_protocol_at(
     }
 }
 
+#[cfg(not(windows))]
 fn apply_running_session_update_decisions(
     release: &ReleaseInfo,
     updated_exe: &Path,
@@ -1527,6 +1622,7 @@ fn apply_running_session_update_decisions(
     Ok(outcomes)
 }
 
+#[cfg(not(windows))]
 fn print_running_session_update_outcomes(
     outcomes: &[RunningSessionUpdateOutcome],
     release: &ReleaseInfo,
@@ -1624,6 +1720,8 @@ fn print_running_session_update_outcomes(
 pub(crate) fn update_install_command() -> &'static str {
     if is_homebrew_managed_install() {
         HOMEBREW_UPDATE_COMMAND
+    } else if is_mise_managed_install() {
+        MISE_UPDATE_COMMAND
     } else if is_nix_managed_install() {
         NIX_UPDATE_COMMAND
     } else {
@@ -1638,6 +1736,10 @@ pub(crate) fn update_install_instruction(install_command: &str) -> String {
         }
         HOMEBREW_UPDATE_COMMAND => {
             "detach, run `brew update && brew upgrade herdr`, then restart this Herdr session when ready".to_string()
+        }
+        MISE_UPDATE_COMMAND => {
+            "detach, run `mise upgrade herdr`, then restart this Herdr session when ready"
+                .to_string()
         }
         NIX_UPDATE_COMMAND => {
             "detach, update through Nix, then restart this Herdr session when ready".to_string()
@@ -1662,8 +1764,55 @@ fn is_nix_managed_install() -> bool {
     is_nix_store_exe_path_following_links(&current_exe)
 }
 
+fn is_mise_managed_install() -> bool {
+    let Ok(current_exe) = env::current_exe() else {
+        return false;
+    };
+
+    is_mise_managed_exe_path_following_links(&current_exe)
+}
+
+pub(crate) fn preview_channel_rejection_for_current_install() -> Option<&'static str> {
+    let Ok(current_exe) = env::current_exe() else {
+        return None;
+    };
+
+    preview_channel_rejection_for_exe_path(&current_exe)
+}
+
+pub(crate) fn package_manager_channel_update_guidance_for_current_install() -> Option<&'static str>
+{
+    if is_homebrew_managed_install() {
+        Some("Use `brew update && brew upgrade herdr` to update Homebrew installs.")
+    } else if is_mise_managed_install() {
+        Some("Use `mise upgrade herdr` to update mise installs.")
+    } else if is_nix_managed_install() {
+        Some("Update through Nix to update Nix-managed Herdr installs.")
+    } else {
+        None
+    }
+}
+
+fn preview_channel_rejection_for_exe_path(path: &Path) -> Option<&'static str> {
+    if is_homebrew_managed_exe_path_following_links(path) {
+        Some(
+            "preview channel is only available for direct Herdr installs; Homebrew installs update through `brew update && brew upgrade herdr`",
+        )
+    } else if is_mise_managed_exe_path_following_links(path) {
+        Some(
+            "preview channel is only available for direct Herdr installs; mise installs update through `mise upgrade herdr`",
+        )
+    } else if is_nix_store_exe_path_following_links(path) {
+        Some("preview channel is only available for direct Herdr installs; Nix installs update through Nix")
+    } else {
+        None
+    }
+}
+
+#[cfg(unix)]
 pub(crate) fn is_package_manager_managed_exe_path(path: &Path) -> bool {
     is_homebrew_managed_exe_path_following_links(path)
+        || is_mise_managed_exe_path_following_links(path)
         || is_nix_store_exe_path_following_links(path)
 }
 
@@ -1685,8 +1834,78 @@ fn is_nix_store_exe_path_following_links(path: &Path) -> bool {
         .is_ok_and(|path| is_nix_store_exe_path(&path))
 }
 
+fn is_mise_managed_exe_path_following_links(path: &Path) -> bool {
+    if is_mise_managed_exe_path(path) {
+        return true;
+    }
+
+    path.canonicalize()
+        .is_ok_and(|path| is_mise_managed_exe_path(&path))
+}
+
 fn is_nix_store_exe_path(path: &Path) -> bool {
     path.starts_with("/nix/store")
+}
+
+fn is_mise_managed_exe_path(path: &Path) -> bool {
+    mise_install_root(path).is_some()
+}
+
+fn mise_install_root(path: &Path) -> Option<PathBuf> {
+    if let Some(root) = mise_install_root_under_configured_installs_dir(path) {
+        return Some(root);
+    }
+
+    mise_install_root_under_named_installs_dir(path)
+}
+
+fn mise_install_root_under_configured_installs_dir(path: &Path) -> Option<PathBuf> {
+    let installs_dir = env::var_os(MISE_INSTALLS_DIR_ENV)
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())?;
+    let version_dir = mise_tool_version_dir(path)?;
+    let tool_dir = version_dir.parent()?;
+    paths_match(tool_dir.parent()?, &installs_dir).then_some(version_dir.to_path_buf())
+}
+
+fn mise_install_root_under_named_installs_dir(path: &Path) -> Option<PathBuf> {
+    let version_dir = mise_tool_version_dir(path)?;
+    let tool_dir = version_dir.parent()?;
+    let installs_dir = tool_dir.parent()?;
+    if installs_dir.file_name()? != "installs" {
+        return None;
+    }
+    Some(version_dir.to_path_buf())
+}
+
+fn mise_tool_version_dir(path: &Path) -> Option<&Path> {
+    if path.file_name()? != "herdr" {
+        return None;
+    }
+    let bin_dir = path.parent()?;
+    if bin_dir.file_name()? != "bin" {
+        return None;
+    }
+    let version_dir = bin_dir.parent()?;
+    let tool_dir = version_dir.parent()?;
+    if tool_dir.file_name()? != "herdr" {
+        return None;
+    }
+    Some(version_dir)
+}
+
+fn paths_match(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+
+    let Ok(left) = left.canonicalize() else {
+        return false;
+    };
+    let Ok(right) = right.canonicalize() else {
+        return false;
+    };
+    left == right
 }
 
 fn is_homebrew_managed_exe_path(path: &Path) -> bool {
@@ -1720,6 +1939,13 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
 /// Manual self-update command (`herdr update`).
 pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
     let channel = UpdateChannel::configured();
+    #[cfg(windows)]
+    if channel == UpdateChannel::Stable {
+        return Err(
+            "Windows builds are preview-only for now; run `herdr channel set preview`".into(),
+        );
+    }
+
     if is_homebrew_managed_install() {
         if channel == UpdateChannel::Preview {
             return Err(
@@ -1728,6 +1954,17 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
         }
         return Err(format!(
             "self-update is disabled for Homebrew installs; run `{HOMEBREW_UPDATE_COMMAND}`"
+        ));
+    }
+
+    if is_mise_managed_install() {
+        if channel == UpdateChannel::Preview {
+            return Err(
+                "self-update is disabled for mise installs; preview is only available for direct Herdr installs".into(),
+            );
+        }
+        return Err(format!(
+            "self-update is disabled for mise installs; run `{MISE_UPDATE_COMMAND}`"
         ));
     }
 
@@ -1758,39 +1995,67 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
         }
     };
 
-    let running_server_plans = plan_running_server_updates(&release)?;
-    let server_update_decisions =
-        confirm_running_server_update_action(running_server_plans, &release, options)?;
-
     if let Some(commit) = &release.commit {
         tracing::info!(commit = %commit, build_id = ?release.build_id, "selected preview update build");
     }
-    eprintln!("downloading {}...", release.label());
     if let Err(e) = crate::release_notes::save_pending(release.label(), &release.notes_body) {
         tracing::warn!("failed to save pending release notes: {e}");
     }
-    let downloaded_update = download_update(&release)?;
-    let updated_exe = downloaded_update.current_exe.clone();
-    eprintln!("downloaded {}", release.label());
-    if !options.live_handoff
-        && !prompt_to_complete_plain_update(&server_update_decisions, &release)?
-    {
-        eprintln!("Herdr was not updated.");
-        eprintln!("Stop running Herdr sessions when ready, then run `herdr update` again.");
-        return Ok(current);
-    }
-    install_downloaded_update(downloaded_update)?;
-    eprintln!("installed {}", release.label());
-    let server_update_decisions = if options.live_handoff {
-        server_update_decisions
-    } else {
-        mark_plain_update_stop_decisions(server_update_decisions)
-    };
-    let server_update_outcomes =
-        apply_running_session_update_decisions(&release, &updated_exe, server_update_decisions)?;
-    print_outdated_integration_notice_with_updated_binary(&updated_exe);
 
-    print_running_session_update_outcomes(&server_update_outcomes, &release);
+    #[cfg(windows)]
+    {
+        let _ = options;
+
+        eprintln!(
+            "installing {} with the Windows installer...",
+            release.label()
+        );
+        if let Some(sha256) = &release.sha256 {
+            tracing::debug!(sha256 = %sha256, "selected Windows update asset has checksum");
+        }
+        install_windows_update_with_installer(channel)?;
+        let updated_exe = windows_installed_herdr_exe_path()?;
+        eprintln!("installed {}", release.label());
+        print_outdated_integration_notice_with_updated_binary(&updated_exe);
+        eprintln!(
+            "Restart any running Herdr sessions to use {}.",
+            release.label()
+        );
+    }
+
+    #[cfg(not(windows))]
+    {
+        let running_server_plans = plan_running_server_updates(&release)?;
+        let server_update_decisions =
+            confirm_running_server_update_action(running_server_plans, &release, options)?;
+
+        eprintln!("downloading {}...", release.label());
+        let downloaded_update = download_update(&release)?;
+        let updated_exe = downloaded_update.current_exe.clone();
+        eprintln!("downloaded {}", release.label());
+        if !options.live_handoff
+            && !prompt_to_complete_plain_update(&server_update_decisions, &release)?
+        {
+            eprintln!("Herdr was not updated.");
+            eprintln!("Stop running Herdr sessions when ready, then run `herdr update` again.");
+            return Ok(current);
+        }
+        install_downloaded_update(downloaded_update)?;
+        eprintln!("installed {}", release.label());
+        let server_update_decisions = if options.live_handoff {
+            server_update_decisions
+        } else {
+            mark_plain_update_stop_decisions(server_update_decisions)
+        };
+        let server_update_outcomes = apply_running_session_update_decisions(
+            &release,
+            &updated_exe,
+            server_update_decisions,
+        )?;
+        print_outdated_integration_notice_with_updated_binary(&updated_exe);
+
+        print_running_session_update_outcomes(&server_update_outcomes, &release);
+    }
 
     Ok(release.version)
 }
@@ -1842,6 +2107,11 @@ pub fn auto_update(events: tokio::sync::mpsc::Sender<crate::events::AppEvent>) {
         return;
     }
 
+    if is_mise_managed_install() && configured_channel == UpdateChannel::Preview {
+        crate::logging::update_check_failed("preview channel is not available for mise installs");
+        return;
+    }
+
     let nix_managed_install = is_nix_managed_install();
     if nix_managed_install && configured_channel == UpdateChannel::Preview {
         crate::logging::update_check_failed("preview channel is not available for Nix installs");
@@ -1874,15 +2144,9 @@ pub fn auto_update(events: tokio::sync::mpsc::Sender<crate::events::AppEvent>) {
     );
 
     // Notify the TUI — blocking_send is safe from a std::thread
-    let install_command = if nix_managed_install {
-        NIX_UPDATE_COMMAND
-    } else {
-        HERDR_UPDATE_COMMAND
-    };
-
     let _ = events.blocking_send(crate::events::AppEvent::UpdateReady {
         version: release.label().to_string(),
-        install_command: install_command.to_string(),
+        install_command: update_install_command().to_string(),
     });
 }
 
@@ -1942,6 +2206,8 @@ fn platform_target() -> (&'static str, &'static str) {
         "linux"
     } else if cfg!(target_os = "macos") {
         "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
     } else {
         "unknown"
     };
@@ -1961,7 +2227,7 @@ fn platform_target() -> (&'static str, &'static str) {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
@@ -2124,6 +2390,58 @@ mod tests {
     }
 
     #[test]
+    fn mise_install_path_is_detected() {
+        let path = Path::new("/home/user/.local/share/mise/installs/herdr/0.6.6/bin/herdr");
+
+        assert!(is_mise_managed_exe_path(path));
+        assert_eq!(
+            mise_install_root(path).unwrap(),
+            PathBuf::from("/home/user/.local/share/mise/installs/herdr/0.6.6")
+        );
+    }
+
+    #[test]
+    fn mise_alias_install_path_is_detected() {
+        let path = Path::new("/home/user/.local/share/mise/installs/herdr/latest/bin/herdr");
+
+        assert!(is_mise_managed_exe_path(path));
+    }
+
+    #[test]
+    fn mise_custom_installs_dir_path_is_detected() {
+        let path = Path::new("/opt/mise-tools/installs/herdr/0.6.6/bin/herdr");
+
+        assert!(is_mise_managed_exe_path(path));
+    }
+
+    #[test]
+    fn mise_configured_installs_dir_path_is_detected() {
+        let _guard = env_lock().lock().unwrap();
+        let previous = std::env::var_os(MISE_INSTALLS_DIR_ENV);
+        std::env::set_var(MISE_INSTALLS_DIR_ENV, "/opt/mise-tools");
+        let path = Path::new("/opt/mise-tools/herdr/0.6.6/bin/herdr");
+
+        assert!(is_mise_managed_exe_path(path));
+        assert_eq!(
+            mise_install_root(path).unwrap(),
+            PathBuf::from("/opt/mise-tools/herdr/0.6.6")
+        );
+
+        if let Some(previous) = previous {
+            std::env::set_var(MISE_INSTALLS_DIR_ENV, previous);
+        } else {
+            std::env::remove_var(MISE_INSTALLS_DIR_ENV);
+        }
+    }
+
+    #[test]
+    fn non_mise_install_path_is_not_detected() {
+        let path = Path::new("/home/user/.local/bin/herdr");
+
+        assert!(!is_mise_managed_exe_path(path));
+    }
+
+    #[test]
     fn package_manager_path_detection_follows_homebrew_symlink() {
         #[cfg(unix)]
         {
@@ -2147,11 +2465,48 @@ mod tests {
     }
 
     #[test]
+    fn package_manager_path_detection_follows_mise_symlink() {
+        #[cfg(unix)]
+        {
+            let root = std::env::temp_dir()
+                .join(format!("herdr-mise-symlink-test-{}", std::process::id()));
+            let version_bin = root.join("installs/herdr/0.6.2/bin");
+            let latest_bin = root.join("installs/herdr/latest/bin");
+            fs::create_dir_all(&version_bin).unwrap();
+            fs::create_dir_all(&latest_bin).unwrap();
+            let version_binary = version_bin.join("herdr");
+            let latest_binary = latest_bin.join("herdr");
+            fs::write(&version_binary, b"").unwrap();
+            std::os::unix::fs::symlink(&version_binary, &latest_binary).unwrap();
+
+            assert!(is_package_manager_managed_exe_path(&latest_binary));
+
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
     fn nix_store_path_is_detected() {
         let path = Path::new("/nix/store/abc123-herdr-0.6.1/bin/herdr");
 
         assert!(is_nix_store_exe_path(path));
         assert!(is_package_manager_managed_exe_path(path));
+    }
+
+    #[test]
+    fn preview_channel_is_rejected_for_package_manager_paths() {
+        let homebrew = Path::new("/opt/homebrew/Cellar/herdr/0.6.6/bin/herdr");
+        let mise = Path::new("/home/user/.local/share/mise/installs/herdr/0.6.6/bin/herdr");
+        let nix = Path::new("/nix/store/abc123-herdr-0.6.6/bin/herdr");
+        let direct = Path::new("/home/user/.local/bin/herdr");
+
+        assert!(preview_channel_rejection_for_exe_path(homebrew)
+            .is_some_and(|message| message.contains("Homebrew")));
+        assert!(preview_channel_rejection_for_exe_path(mise)
+            .is_some_and(|message| message.contains("mise")));
+        assert!(preview_channel_rejection_for_exe_path(nix)
+            .is_some_and(|message| message.contains("Nix")));
+        assert!(preview_channel_rejection_for_exe_path(direct).is_none());
     }
 
     #[test]
@@ -2233,6 +2588,10 @@ mod tests {
         assert_eq!(
             update_install_instruction(HOMEBREW_UPDATE_COMMAND),
             "detach, run `brew update && brew upgrade herdr`, then restart this Herdr session when ready"
+        );
+        assert_eq!(
+            update_install_instruction(MISE_UPDATE_COMMAND),
+            "detach, run `mise upgrade herdr`, then restart this Herdr session when ready"
         );
     }
 
@@ -2984,16 +3343,16 @@ mod tests {
 
     #[test]
     fn stable_channel_installs_stable_asset_when_current_binary_is_preview() {
-        let older_stable = Version::parse("0.6.5").unwrap();
-        let preview_base = Version::parse("0.6.6").unwrap();
+        let latest_stable = Version::parse("0.6.6").unwrap();
+        let installed_base = Version::parse("0.6.6").unwrap();
         assert!(stable_channel_should_install(
-            &older_stable,
-            &preview_base,
+            &latest_stable,
+            &installed_base,
             true
         ));
         assert!(!stable_channel_should_install(
-            &older_stable,
-            &preview_base,
+            &latest_stable,
+            &installed_base,
             false
         ));
     }
